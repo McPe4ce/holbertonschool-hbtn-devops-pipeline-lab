@@ -1,0 +1,96 @@
+# ---------------------------------------------------------------------------
+# Continuous integration for hbtn-devops-pipeline-lab.
+#
+# The three seeded faults have been repaired:
+#   1. `steps:` was indented one column too far, so the file never parsed.
+#   2. `npm install-deps` is not an npm command; the install is `npm ci`.
+#   3. The integration suite had no DATABASE_URL, so it failed at the first
+#      query with "DATABASE_URL is not set".
+#
+# On top of the repair the job now caches npm's download directory, lints
+# before it tests, and publishes a JUnit report as a build artifact.
+# ---------------------------------------------------------------------------
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pipeline
+          POSTGRES_PASSWORD: pipeline
+          POSTGRES_DB: pipeline
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pipeline -d pipeline"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Cache only npm's download cache, never node_modules: the tarballs in
+      # ~/.npm are platform-neutral, while node_modules holds built artefacts
+      # that `npm ci` must lay down itself.
+      #
+      # The exact key carries a hash of the lock file, so any dependency change
+      # writes a brand-new cache entry. The restore-keys prefix lets a run that
+      # misses the exact key still warm itself from the newest older cache, and
+      # npm then downloads only the tarballs that entry is missing.
+      - name: Cache npm downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Lint sits between install and the tests: it needs node_modules, and a
+      # style failure should stop the job before the slower suites run.
+      - name: Run ESLint
+        run: npm run lint
+
+      # One `npm test` covers both suites, so the reporter writes a single
+      # reports/junit.xml. The integration tests run their own migrations and
+      # reach the service container over the mapped port on localhost.
+      - name: Run the test suite
+        env:
+          DATABASE_URL: postgres://pipeline:pipeline@localhost:5432/pipeline
+          JEST_JUNIT_OUTPUT_DIR: ./reports
+        run: npm test -- --reporters=default --reporters=jest-junit
+
+      # `if: always()` is the point of this step: a failing test run is exactly
+      # when the report is worth reading, and a plain step would be skipped.
+      - name: Upload the JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-report
+          path: reports/
+          retention-days: 7
